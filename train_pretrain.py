@@ -28,6 +28,7 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    #！ 调整学习率，余弦退火
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
@@ -38,33 +39,41 @@ def train_epoch(epoch, wandb):
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
-        # ! 结合 warmup 的余弦退火策略,每个 step 动态计算学习率
+        #! 混合调度策略：将余弦退火曲线下移10%的初始值，避免训练初期学习率剧烈波动
+        #! 实时更新：每个step独立计算，实现细粒度调整（区别于传统的epoch级调整）
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         with ctx:
+            #！ 前向传播
             res = model(X)
+            #! 带mask的交叉熵计算
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask.sum()
+            #! 支持MoE架构的辅助损失
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
-        # ! 缩放损失进行反向传
+        # ! 梯度优化系统，反向传播部分使用了梯度缩放
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
+            #! 清零梯度
             scaler.unscale_(optimizer)
+            #! 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
+            #! 缩放因子调整
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0:
+            #！时间预估：动态计算剩余epoch时间
             spend_time = time.time() - start_time
             Logger(
                 'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.12f} epoch_Time:{}min:'.format(
@@ -76,11 +85,15 @@ def train_epoch(epoch, wandb):
                     optimizer.param_groups[-1]['lr'],
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
 
+            #！ 主从架构：仅rank 0进程执行IO密集型操作
+            #！ 屏障同步：通过DDP内部同步机制保证各进程训练步调一致
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
+        #！分布式适配：正确处理DDP包装后的模型参数
+        #！增量保存：按step间隔保存，提供断点续训能力
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
@@ -110,9 +123,13 @@ def init_distributed_mode():
     global ddp_local_rank, DEVICE
 
     dist.init_process_group(backend="nccl")
+    #! 全局进程ID（跨机器时唯一）
     ddp_rank = int(os.environ["RANK"])
+    #! 本地GPU序号（单机内0~N-1）
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    #! 总进程数（GPU总数）
     ddp_world_size = int(os.environ["WORLD_SIZE"])
+    #! 设备绑定资源，硬件级隔离：确保每个进程独占指定GPU，防止显存竞争；性能优化：避免GPU间上下文切换开销
     DEVICE = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(DEVICE)
 
@@ -124,7 +141,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     # ! 模型输出目录
     parser.add_argument("--out_dir", type=str, default="out")
-    # !  预训练数据路径
+    # ! 预训练数据路径
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
 
 
@@ -159,12 +176,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true")
     #！#！监控与调试-WandB 项目名称
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
-    #！监控与调试-学习率预热的迭代次数。预热的意思是，刚开始训练的时候，学习率很小，然后逐渐增加到预定的学习率，这样可以避免模型在初期因为学习率太高导致的不稳定。
+    #！监控与调试-学习率预热的迭代次数。刚开始训练的时候，学习率很小，然后逐渐增加到预定的学习率，这样可以避免模型在初期因为学习率太高导致的不稳定。
     parser.add_argument("--warmup_iters", type=int, default=0)
     #！监控与调试-日志打印间隔（步），控制控制台输出频率
     parser.add_argument("--log_interval", type=int, default=100)
     #！监控与调试-模型保存间隔（步），定期保存检查点
     parser.add_argument("--save_interval", type=int, default=100)
+
 
     # ! 模型架构参数-模型隐藏层维度,影响模型容量
     parser.add_argument('--dim', default=512, type=int)
